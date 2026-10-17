@@ -1,0 +1,81 @@
+# A Go module has no registry upload: the version tag is the release. When a
+# merge to main changes VERSION, this tags the commit v<version>, then asks the
+# Go module proxy for the new version, so the proxy caches it and the first
+# `go get` of the version is fast. A version that already has its tag is
+# skipped, so other merges release nothing.
+# A version the proxy has cached is permanent. Fix a mistake with a new version.
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time, so two merges cannot publish the same version twice.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  version:
+    # Releases come from main only, also when the workflow is started by hand.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Read the version and look for its tag
+        id: version
+        run: |
+          version=$(cat VERSION)
+          echo "version=${version}" >>"$GITHUB_OUTPUT"
+          # --exit-code: 0 when the tag exists, 2 when it does not, other codes on errors.
+          if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null; then
+            echo "v${version} is already tagged, so it is already published. Nothing to do."
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "${status}" != 2 ]; then exit "${status}"; fi
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+
+      # A tag the proxy has fetched cannot be taken back, so tag only a module that builds.
+      - name: Build
+        run: go build ./...
+
+      # The workflow token pushes the tag, so it does not start another workflow run.
+      - name: Push the tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git tag "v${VERSION}" "${GITHUB_SHA}"
+          git push origin "refs/tags/v${VERSION}"
+
+      - name: Fetch the version from proxy.golang.org
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          GOPROXY: https://proxy.golang.org
+        run: |
+          module=$(go mod edit -json | jq -r .Module.Path)
+          # Outside the module, so go resolves the version through the proxy, not this checkout.
+          cd "$RUNNER_TEMP"
+          go list -m "${module}@v${VERSION}"
